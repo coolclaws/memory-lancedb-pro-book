@@ -8,6 +8,31 @@ CLI 工具（命令行前缀 `openclaw memory-pro`）面向的是开发者和管
 
 具体来说，CLI 需要支持：批量操作（agent 工具一次处理一条记忆，CLI 需要处理成百上千条）、数据导入导出（agent 无需关心持久化格式，但管理员需要备份和恢复）、系统诊断（agent 只需要 `memory_stats`，管理员需要更详细的健康状态信息）。
 
+### 核心流程
+
+```
+CLI 命令体系:
+
+openclaw memory-pro
+├── CRUD 操作
+│   ├── list --------+---> 枚举浏览 (默认 limit=50, 支持 --json)
+│   ├── search ------+---> 语义搜索 (调用 retriever)
+│   ├── delete ------+---> 单条删除
+│   ├── delete-bulk -+---> 批量删除 (必填 scope + dry-run + 二次确认)
+│   ├── forget ------+---> delete 别名 (语义一致性)
+│   └── update ------+---> 修改内容/重要性/scope
+├── 数据管理
+│   ├── export ------+---> 导出 JSON (不含向量, 人类可读)
+│   ├── import ------+---> 导入 + 重新嵌入 (跨模型可移植)
+│   └── stats -------+---> 统计概览
+├── 系统维护
+│   ├── reembed -----+---> 嵌入模型迁移 (批量重新向量化)
+│   ├── upgrade -----+---> 元数据批量升级 (--no-llm 可选)
+│   └── migrate -----+---> 三阶段迁移 (check → run → verify)
+└── 认证
+    └── auth --------+---> login / status / logout (OAuth)
+```
+
 ```typescript
 // 文件: cli.ts L20-60
 // CLI 命令注册结构
@@ -37,6 +62,26 @@ program.command('migrate')
 // 认证
 program.command('auth')
 program.command('version')
+```
+
+### 模块关系
+
+```
+CLI 与运行时系统的关系:
+
+CLI (cli.ts, 面向人类)          Runtime (tools.ts, 面向 LLM)
+─────────────────────          ──────────────────────────
+list    ←──共享──→  memory_list    │ 共享 MemoryStore
+search  ←──共享──→  memory_recall  │ 共享 MemoryRetriever
+delete  ←──共享──→  memory_forget  │ 共享 ScopeManager
+update  ←──共享──→  memory_update  │
+                                   │
+CLI 独有:                          │ Runtime 独有:
+  export / import                  │   before_agent_start (自动召回)
+  reembed                          │   agent_end (自动捕获)
+  migrate / upgrade                │   self_improvement_*
+  auth                             │
+  delete-bulk (批量操作)            │
 ```
 
 ## 17.2 CRUD 命令的工程细节
@@ -114,6 +159,10 @@ program
 `delete-bulk` 的安全设计值得特别关注。首先，`--scope` 是 `requiredOption`——不允许在不指定作用域的情况下执行批量删除，防止意外删除全局数据。其次，`--dry-run` 标志让用户在实际删除前预览受影响的记忆。最后，即使没有 `--dry-run`，系统仍然会要求二次确认。
 
 这种三重保护（必填 scope + dry-run 预览 + 二次确认）在数据库管理工具中是最佳实践。对于一个存储了 agent 知识库的系统，误删的代价可能比误删普通数据更高——那些被 agent 通过多次交互积累的知识，无法简单地从其他数据源重建。
+
+### 设计取舍
+
+**三阶段迁移**（check/run/verify）的替代方案是一步到位的"自动迁移"——检测到旧数据时自动升级。自动迁移用户体验更好（无需手动操作），但风险也更高：迁移过程中如果出错，用户可能不知道数据已被部分修改。三阶段设计将风险分散到三个可独立执行、可安全中断的步骤中——check 不修改任何数据，run 的错误可以通过 verify 发现，每一步都给用户充分的控制权。**导出不含向量**的决策牺牲了导入速度（需要重新嵌入），但获得了三个收益：跨模型可移植性（不同嵌入模型的向量不兼容）、文件体积减小（向量数据是文本数据的 10-20 倍）、人类可读性（不含向量的 JSON 可以手动编辑）。对于记忆数据这种"文本为本、向量为索引"的特性，这个取舍是正确的。
 
 ### forget 别名
 

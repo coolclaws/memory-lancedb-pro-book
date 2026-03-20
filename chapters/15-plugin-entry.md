@@ -14,6 +14,61 @@
 
 这五个职责之间有严格的执行顺序——配置必须先于初始化，初始化必须先于注册，注册必须先于后台服务启动。这就是为什么这些代码需要集中在一个文件中：分散到多个文件会使执行顺序的保证变得脆弱。
 
+### 核心流程
+
+```
+index.ts 生命周期编排全流程:
+
+插件启动:
+  ① 配置解析 ──+---> resolveEnvVars() ──+---> 验证必填项
+  ② 基础设施  ──+---> LanceDB.connect() + createEmbedder()
+  ③ 核心存储  ──+---> MemoryStore + ensureTable()
+  ④ 检索 & 域  ──+---> ScopeManager + MemoryRetriever
+  ⑤ 可选子系统 ──+---> SmartExtractor / DecayEngine /
+                      TierManager / Reflection (按特性开关)
+  ⑥ 工具注册  ──+---> 6 核心工具 + 可选管理工具
+  ⑦ 后台服务  ──+---> 健康检查(60s) + 自动备份 + 升级提示
+
+运行时生命周期钩子:
+  before_agent_start ──+---> 自动召回 core 记忆
+                       +---> 加载上次会话上下文
+                       +---> 注入系统提示
+
+  agent_end ──+---> SmartExtractor 自动提取记忆
+              +---> Reflection 会话反思
+              +---> SessionMemory 保存会话
+              +---> AccessTracker flush
+
+  command:new ──+---> 新建会话 + 清除瞬态记忆
+  command:reset ──+---> 重置到 core 层 + 清除会话
+```
+
+### 模块关系
+
+```
+index.ts 子系统初始化依赖 DAG:
+
+Layer 1 (基础设施, 无依赖):
+  LanceDB ────────────────────────┐
+  Embedder ──────────────────────┐│
+                                 ││
+Layer 2 (核心存储):              ││
+  MemoryStore ──depends──> LanceDB
+                                 │
+Layer 3 (检索 & 作用域):          │
+  ScopeManager (无外部依赖)       │
+  MemoryRetriever ──depends──> MemoryStore
+                  ──depends──> Embedder
+                  ──depends──> ScopeManager
+
+Layer 4 (可选, 按特性开关):
+  SmartExtractor ──depends──> Embedder
+  DecayEngine ────depends──> MemoryStore
+  TierManager ────depends──> MemoryStore
+  AccessTracker ──depends──> MemoryStore (始终启用)
+  Reflection ─────depends──> MemoryStore + Retriever + ScopeManager
+```
+
 ## 15.2 配置解析与环境变量
 
 ```typescript
@@ -117,6 +172,10 @@ async function initializePlugin(config: PluginConfig): Promise<PluginInstance> {
 **第四层：可选子系统**。这些子系统通过 `config.features` 中的特性开关控制。每个子系统都依赖前三层的某些组件，但彼此之间没有强依赖。这种设计允许用户按需启用功能，最小化资源消耗。
 
 为什么 `AccessTracker` 没有特性开关？因为访问追踪是记忆层级（tier）和衰减（decay）机制的数据基础。即使用户不启用 `DecayEngine`，记录访问数据也是有价值的——当未来启用衰减时，历史访问数据可以立即被利用，而不需要从零开始积累。这是一个典型的"预投资"设计决策。
+
+### 设计取舍
+
+**3500 行单文件 vs 多文件拆分**是最常被质疑的设计决策。多文件方案（将配置解析、初始化、钩子、工具注册分散到 4-5 个文件）在可导航性上更好，但需要引入显式的初始化编排框架（如依赖注入容器）来保证执行顺序。在 memory-lancedb-pro 的场景中，初始化顺序是严格的 DAG——配置先于连接、连接先于存储、存储先于检索——任何打乱都会导致运行时错误。单文件中代码的物理位置天然保证了执行顺序，比 DI 容器的声明式依赖更直观、更不容易出错。此外，index.ts 虽然行数多但结构清晰（五个区块各司其职），一个 3500 行的线性流程比 10 个文件间的跳转更容易理解。**AccessTracker 始终启用**的决策牺牲了少量的运行时开销，换取了"未来启用衰减时立即可用历史数据"的预投资收益——这是一个时间维度上的取舍。
 
 ## 15.4 四个生命周期钩子
 

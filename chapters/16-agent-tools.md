@@ -12,6 +12,43 @@
 
 `tools.ts` 在这两个维度上都下了功夫。
 
+### 核心流程
+
+```
+Agent 工具调用完整流程:
+
+LLM 决策调用工具
+       |
+       v
++------+--------+    +-----------+    +----------+
+| 参数 Schema    +--->+ TypeBox   +--->+ 运行时   |
+| 验证 (JSON     |    | 校验      |    | 参数解析 |
+| Schema)        |    +-----------+    +-----+----+
++---------------+                           |
+                                            v
+                                    +-------+-------+
+                              +-----+ Scope 权限    +-----+
+                              |     | 检查          |     |
+                              |     +---------------+     |
+                              v                           v
+                         [有权限]                    [无权限] → 报错
+
++----+---+---+---+---+---+
+|    |   |   |   |   |   |
+v    v   v   v   v   v   v
+recall store update forget list stats
+ |     |     |      |     |    |
+ v     v     v      v     v    v
+Retriever Store Store  Store Store Store
+(混合检索) (写入) (更新+  (删除) (枚举) (统计)
+            版本控制)
+
+管理工具 (enableManagementTools=true):
+  self_improvement_log ──> 观察行为
+  self_improvement_extract_skill ──> 提取技能
+  self_improvement_review ──> 回顾改进
+```
+
 ## 16.2 memory_recall：混合检索的入口
 
 ```typescript
@@ -66,6 +103,10 @@ const memoryRecallTool = {
 参数设计中，`query` 被描述为 "Natural language search query"。这个措辞引导 LLM 传入自然语言查询（"关于数据库连接的配置"）而非关键词列表（"database connection config"），因为 `MemoryRetriever` 的语义检索对自然语言查询的效果更好。
 
 `scope` 参数是可选的，这一点至关重要。如果 scope 是必填的，LLM 每次召回记忆时都需要先知道自己的 agent ID 和可用作用域——这对 LLM 来说是不必要的认知负担。当 scope 未指定时，系统自动使用 `scopeManager.getAccessibleScopes` 获取该 agent 的所有可访问作用域。
+
+### 设计取舍
+
+工具设计的核心取舍在于**LLM 友好性 vs 系统精确性**。以 `memory_recall` 为例，描述用"Search and retrieve relevant memories"（认知层面）而非"Query the vector database"（实现层面），因为 LLM 依赖语义理解来决定调用时机。`query` 参数描述为"Natural language search query"引导 LLM 传入自然语言而非关键词列表——后者在语义检索中效果更差。`scope` 设为可选而非必填，避免了 LLM 需要额外获取 agent ID 的认知负担。这些设计牺牲了一些系统的显式控制（例如不强制指定 scope 可能导致搜索范围过宽），换取了 LLM 正确调用工具的更高概率。**管理工具的特性开关**也是一个取舍：默认关闭意味着大多数用户无法使用自我改进能力，但在企业合规环境中 agent 自主修改行为模式可能不被允许——安全优先。
 
 返回值的设计同样值得关注。`score` 字段暴露了相关性分数，这让 LLM 可以判断召回结果的质量。如果所有结果的 score 都很低，LLM 可以推断"记忆库中没有与当前问题相关的信息"，从而避免基于低质量召回结果做出错误推断。
 
